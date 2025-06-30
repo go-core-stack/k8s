@@ -1,101 +1,176 @@
 package apply
 
 import (
-	"context"
-	"fmt"
-	"log"
+	"github.com/pkg/errors"
 
-	operv1 "github.com/openshift/api/operator/v1"
-	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 )
 
-// getCurrentFromUnstructured retrieves the current unstructured object in the
-// database from the provided one
-func getCurrentFromUnstructured(ctx context.Context, client cnoclient.ClusterClient, updated *uns.Unstructured) (*uns.Unstructured, error) {
-	name := updated.GetName()
-	namespace := updated.GetNamespace()
-	gkv := updated.GroupVersionKind()
-	objDesc := fmt.Sprintf("(%s) %s/%s", gkv.String(), namespace, name)
+// MergeMetadataForUpdate merges the read-only fields of metadata.
+// This is to be able to do a a meaningful comparison in apply,
+// since objects created on runtime do not have these fields populated.
+func MergeMetadataForUpdate(current, updated *uns.Unstructured) error {
+	updated.SetCreationTimestamp(current.GetCreationTimestamp())
+	updated.SetSelfLink(current.GetSelfLink())
+	updated.SetGeneration(current.GetGeneration())
+	updated.SetUID(current.GetUID())
+	updated.SetResourceVersion(current.GetResourceVersion())
 
-	current := &uns.Unstructured{}
-	current.SetGroupVersionKind(gkv)
-	err := client.CRClient().Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, current)
-	if apierrors.IsNotFound(err) {
-		log.Printf("Object %s does not exist, no merge needed", objDesc)
-		return nil, nil
-	}
-	if err != nil {
-		err = fmt.Errorf("Object %s could not be retrieved, %w", objDesc, err)
-		return nil, err
-	}
+	mergeAnnotations(current, updated)
+	mergeLabels(current, updated)
 
-	return current, nil
+	return nil
 }
 
-// mergeOperConfigForUpdate handle server-side apply exceptions for the operator
-// config object
-func mergeOperConfigForUpdate(current, updated *uns.Unstructured) error {
-	if current == nil {
-		// if there is no existing object, merge is not needed
-		return nil
-	}
-
-	// unfortunately disableNetworkDiagnostics it's not a pointer so we can't
-	// make it a noop in the server side apply
-	// since it's supposed to be changed by the user and not programmatically
-	// lets make sure it stays at its current value here
-	disableNetworkDiagnostics, found, err := uns.NestedBool(current.Object, "spec", "disableNetworkDiagnostics")
-	if err != nil {
+// MergeObjectForUpdate prepares a "desired" object to be updated.
+// Some objects, such as Deployments and Services require
+// some semantic-aware updates
+func MergeObjectForUpdate(current, updated *uns.Unstructured) error {
+	if err := MergeDeploymentForUpdate(current, updated); err != nil {
 		return err
 	}
-	if found {
-		if err := uns.SetNestedField(updated.Object, disableNetworkDiagnostics, "spec", "disableNetworkDiagnostics"); err != nil {
+
+	if err := MergeServiceForUpdate(current, updated); err != nil {
+		return err
+	}
+
+	if err := MergeServiceAccountForUpdate(current, updated); err != nil {
+		return err
+	}
+
+	// For all object types, merge metadata.
+	// Run this last, in case any of the more specific merge logic has
+	// changed "updated"
+	MergeMetadataForUpdate(current, updated)
+
+	return nil
+}
+
+const (
+	deploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
+)
+
+// MergeDeploymentForUpdate updates Deployment objects.
+// We merge annotations, keeping ours except the Deployment Revision annotation.
+func MergeDeploymentForUpdate(current, updated *uns.Unstructured) error {
+	gvk := updated.GroupVersionKind()
+	if gvk.Group == "apps" && gvk.Kind == "Deployment" {
+
+		// Copy over the revision annotation from current up to updated
+		// otherwise, updated would win, and this annotation is "special" and
+		// needs to be preserved
+		curAnnotations := current.GetAnnotations()
+		updatedAnnotations := updated.GetAnnotations()
+		if updatedAnnotations == nil {
+			updatedAnnotations = map[string]string{}
+		}
+
+		anno, ok := curAnnotations[deploymentRevisionAnnotation]
+		if ok {
+			updatedAnnotations[deploymentRevisionAnnotation] = anno
+		}
+
+		updated.SetAnnotations(updatedAnnotations)
+	}
+
+	return nil
+}
+
+// MergeServiceForUpdate ensures the clusterip is never written to
+func MergeServiceForUpdate(current, updated *uns.Unstructured) error {
+	gvk := updated.GroupVersionKind()
+	if gvk.Group == "" && gvk.Kind == "Service" {
+		clusterIP, found, err := uns.NestedString(current.Object, "spec", "clusterIP")
+		if err != nil {
 			return err
+		}
+
+		if found {
+			return uns.SetNestedField(updated.Object, clusterIP, "spec", "clusterIP")
 		}
 	}
 
 	return nil
 }
 
-// mergerFunction provided by getMergeForUpdate merges the existing object with
-// the updated object. Returns the merged updated object as unstructured. Note
-// that this merger function is not supposed to make any changes in the database.
-type mergerFunction func(ctx context.Context, client cnoclient.ClusterClient) (*uns.Unstructured, error)
+// MergeServiceAccountForUpdate copies secrets from current to updated.
+// This is intended to preserve the auto-generated token.
+// Right now, we just copy current to updated and don't support supplying
+// any secrets ourselves.
+func MergeServiceAccountForUpdate(current, updated *uns.Unstructured) error {
+	gvk := updated.GroupVersionKind()
+	if gvk.Group == "" && gvk.Kind == "ServiceAccount" {
+		curSecrets, ok, err := uns.NestedSlice(current.Object, "secrets")
+		if err != nil {
+			return err
+		}
 
-// getMergeForUpdate returns a function for the provided object that merges some
-// of the existing data into the object as an exception to situations that are
-// not handled correctly in the server-side apply
-func getMergeForUpdate(obj Object) mergerFunction {
-	var doMerge func(current, updated *uns.Unstructured) error
+		if ok {
+			uns.SetNestedField(updated.Object, curSecrets, "secrets")
+		}
 
-	gvk := obj.GetObjectKind().GroupVersionKind()
-	if gvk.Group == operv1.GroupName && gvk.Kind == "Network" {
-		doMerge = mergeOperConfigForUpdate
+		curImagePullSecrets, ok, err := uns.NestedSlice(current.Object, "imagePullSecrets")
+		if err != nil {
+			return err
+		}
+		if ok {
+			uns.SetNestedField(updated.Object, curImagePullSecrets, "imagePullSecrets")
+		}
+	}
+	return nil
+}
+
+// mergeAnnotations copies over any annotations from current to updated,
+// with updated winning if there's a conflict
+func mergeAnnotations(current, updated *uns.Unstructured) {
+	updatedAnnotations := updated.GetAnnotations()
+	curAnnotations := current.GetAnnotations()
+
+	if curAnnotations == nil {
+		curAnnotations = map[string]string{}
 	}
 
-	if doMerge != nil {
-		return func(ctx context.Context, client cnoclient.ClusterClient) (*uns.Unstructured, error) {
-			updated, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
-			if err != nil {
-				return nil, err
-			}
-			updatedUns := &uns.Unstructured{Object: updated}
+	for k, v := range updatedAnnotations {
+		curAnnotations[k] = v
+	}
 
-			currentUns, err := getCurrentFromUnstructured(ctx, client, updatedUns)
-			if err != nil {
-				return nil, err
-			}
+	updated.SetAnnotations(curAnnotations)
+}
 
-			err = doMerge(currentUns, updatedUns)
-			if err != nil {
-				return nil, err
-			}
-			return updatedUns, nil
+// mergeLabels copies over any labels from current to updated,
+// with updated winning if there's a conflict
+func mergeLabels(current, updated *uns.Unstructured) {
+	updatedLabels := updated.GetLabels()
+	curLabels := current.GetLabels()
+
+	if curLabels == nil {
+		curLabels = map[string]string{}
+	}
+
+	for k, v := range updatedLabels {
+		curLabels[k] = v
+	}
+
+	updated.SetLabels(curLabels)
+}
+
+// IsObjectSupported rejects objects with configurations we don't support.
+// This catches ServiceAccounts with secrets, which is valid but we don't
+// support reconciling them.
+func IsObjectSupported(obj *uns.Unstructured) error {
+	gvk := obj.GroupVersionKind()
+
+	// We cannot create ServiceAccounts with secrets because there's currently
+	// no need and the merging logic is complex.
+	// If you need this, please file an issue.
+	if gvk.Group == "" && gvk.Kind == "ServiceAccount" {
+		secrets, ok, err := uns.NestedSlice(obj.Object, "secrets")
+		if err != nil {
+			return err
+		}
+
+		if ok && len(secrets) > 0 {
+			return errors.Errorf("cannot create ServiceAccount with secrets")
 		}
 	}
 
