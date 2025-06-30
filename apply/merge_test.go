@@ -1,84 +1,276 @@
 package apply
 
 import (
-	"context"
-	"reflect"
+	"bytes"
 	"testing"
 
-	operv1 "github.com/openshift/api/operator/v1"
-	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
-	"github.com/openshift/cluster-network-operator/pkg/client/fake"
-
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes/scheme"
+	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
-func init() {
-	utilruntime.Must(operv1.AddToScheme(scheme.Scheme))
+// TestReconcileNamespace makes sure that namespace
+// annotations are merged, and everything else is overwritten
+// Namespaces use the "generic" logic; deployments and services
+// have custom logic
+func TestMergeNamespace(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cur := UnstructuredFromYaml(t, `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ns1
+  labels:
+    a: cur
+    b: cur
+  annotations:
+    a: cur
+    b: cur`)
+
+	upd := UnstructuredFromYaml(t, `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ns1
+  labels:
+    a: upd
+    c: upd
+  annotations:
+    a: upd
+    c: upd`)
+
+	// this mutates updated
+	err := MergeObjectForUpdate(cur, upd)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	g.Expect(upd.GetLabels()).To(Equal(map[string]string{
+		"a": "upd",
+		"b": "cur",
+		"c": "upd",
+	}))
+
+	g.Expect(upd.GetAnnotations()).To(Equal(map[string]string{
+		"a": "upd",
+		"b": "cur",
+		"c": "upd",
+	}))
 }
 
-func Test_Merge(t *testing.T) {
-	tests := []struct {
-		name     string
-		kind     schema.GroupVersionKind
-		initial  Object
-		input    Object
-		expected Object
-	}{
-		{
-			"no merge if operator config does not exist",
-			schema.GroupVersionKind{
-				Group:   operv1.GroupName,
-				Kind:    "Network",
-				Version: operv1.GroupVersion.Version,
-			},
-			nil,
-			&operv1.Network{},
-			&operv1.Network{},
-		},
-		{
-			"merge operator config DisableNetworkDiagnostics remains at current value",
-			schema.GroupVersionKind{
-				Group:   operv1.GroupName,
-				Kind:    "Network",
-				Version: operv1.GroupVersion.Version,
-			},
-			&operv1.Network{
-				Spec: operv1.NetworkSpec{
-					DisableNetworkDiagnostics: true,
-				},
-			},
-			&operv1.Network{},
-			&operv1.Network{
-				Spec: operv1.NetworkSpec{
-					DisableNetworkDiagnostics: true,
-				},
-			},
-		},
+func TestMergeDeployment(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cur := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1
+  labels:
+    a: cur
+    b: cur
+  annotations:
+    deployment.kubernetes.io/revision: cur
+    a: cur
+    b: cur`)
+
+	upd := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1
+  labels:
+    a: upd
+    c: upd
+  annotations:
+    deployment.kubernetes.io/revision: upd
+    a: upd
+    c: upd`)
+
+	// this mutates updated
+	err := MergeObjectForUpdate(cur, upd)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	// labels are not merged
+	g.Expect(upd.GetLabels()).To(Equal(map[string]string{
+		"a": "upd",
+		"b": "cur",
+		"c": "upd",
+	}))
+
+	// annotations are merged
+	g.Expect(upd.GetAnnotations()).To(Equal(map[string]string{
+		"a": "upd",
+		"b": "cur",
+		"c": "upd",
+
+		"deployment.kubernetes.io/revision": "cur",
+	}))
+}
+
+func TestMergeNilCur(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cur := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1`)
+
+	upd := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1
+  labels:
+    a: upd
+    c: upd
+  annotations:
+    a: upd
+    c: upd`)
+
+	// this mutates updated
+	err := MergeObjectForUpdate(cur, upd)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	g.Expect(upd.GetLabels()).To(Equal(map[string]string{
+		"a": "upd",
+		"c": "upd",
+	}))
+
+	g.Expect(upd.GetAnnotations()).To(Equal(map[string]string{
+		"a": "upd",
+		"c": "upd",
+	}))
+}
+
+func TestMergeNilMeta(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cur := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1`)
+
+	upd := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1`)
+
+	// this mutates updated
+	err := MergeObjectForUpdate(cur, upd)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	g.Expect(upd.GetLabels()).To(BeEmpty())
+}
+
+func TestMergeNilUpd(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cur := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1
+  labels:
+    a: cur
+    b: cur
+  annotations:
+    a: cur
+    b: cur`)
+
+	upd := UnstructuredFromYaml(t, `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d1`)
+
+	// this mutates updated
+	err := MergeObjectForUpdate(cur, upd)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	g.Expect(upd.GetLabels()).To(Equal(map[string]string{
+		"a": "cur",
+		"b": "cur",
+	}))
+
+	g.Expect(upd.GetAnnotations()).To(Equal(map[string]string{
+		"a": "cur",
+		"b": "cur",
+	}))
+}
+
+func TestMergeService(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cur := UnstructuredFromYaml(t, `
+apiVersion: v1
+kind: Service
+metadata:
+  name: d1
+spec:
+  clusterIP: cur`)
+
+	upd := UnstructuredFromYaml(t, `
+apiVersion: v1
+kind: Service
+metadata:
+  name: d1
+spec:
+  clusterIP: upd`)
+
+	err := MergeObjectForUpdate(cur, upd)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	ip, _, err := uns.NestedString(upd.Object, "spec", "clusterIP")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(ip).To(Equal("cur"))
+}
+
+func TestMergeServiceAccount(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cur := UnstructuredFromYaml(t, `
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: d1
+  annotations:
+    a: cur
+secrets:
+- foo`)
+
+	upd := UnstructuredFromYaml(t, `
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: d1
+  annotations:
+    b: upd`)
+
+	err := IsObjectSupported(cur)
+	g.Expect(err).To(MatchError(ContainSubstring("cannot create ServiceAccount with secrets")))
+
+	err = MergeObjectForUpdate(cur, upd)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	s, ok, err := uns.NestedSlice(upd.Object, "secrets")
+	g.Expect(ok).To(BeTrue())
+	g.Expect(s).To(ConsistOf("foo"))
+}
+
+// UnstructuredFromYaml creates an unstructured object from a raw yaml string
+func UnstructuredFromYaml(t *testing.T, obj string) *uns.Unstructured {
+	t.Helper()
+	buf := bytes.NewBufferString(obj)
+	decoder := yaml.NewYAMLOrJSONDecoder(buf, 4096)
+
+	u := uns.Unstructured{}
+	err := decoder.Decode(&u)
+	if err != nil {
+		t.Fatalf("failed to parse test yaml: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			g := NewGomegaWithT(t)
-			var client cnoclient.Client
-			if tt.initial != nil {
-				client = fake.NewFakeClient(tt.initial)
-			} else {
-				client = fake.NewFakeClient()
-			}
-			tt.input.GetObjectKind().SetGroupVersionKind(tt.kind)
-			tt.expected.GetObjectKind().SetGroupVersionKind(tt.kind)
-			merge := getMergeForUpdate(tt.input)
-			g.Expect(merge).NotTo(BeNil())
-			uns, err := merge(context.Background(), client.Default())
-			g.Expect(err).NotTo(HaveOccurred())
-			output := reflect.New(reflect.ValueOf(tt.expected).Elem().Type()).Interface()
-			err = runtime.DefaultUnstructuredConverter.FromUnstructured(uns.Object, output)
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(output).To(Equal(tt.expected))
-		})
-	}
+	return &u
 }

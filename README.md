@@ -2,7 +2,7 @@
 Kubernetes funcs and libraries
 
 ## Apply
-This pkg is a copy as-is from https://github.com/openshift/cluster-network-operator/tree/master/pkg/apply
+This pkg is a copy as-is from https://github.com/atsgen/tf-operator/blob/master/pkg/apply
 
 responsible for providing kubectl apply equivalent constructs to be done from a golang based controller
 
