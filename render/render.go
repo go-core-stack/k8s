@@ -70,7 +70,7 @@ func RenderDirs(manifestDirs []string, d *RenderData) ([]*unstructured.Unstructu
 	sort.Sort(files)
 
 	for _, path := range files {
-		objs, err := RenderTemplate(path, d)
+		objs, err := RenderTemplateFromFile(path, d)
 		if err != nil {
 			return nil, fmt.Errorf("failed to render file %s: %w", path, err)
 		}
@@ -94,10 +94,21 @@ func (a byFilename) Less(i, j int) bool {
 	return p1 < p2
 }
 
-// RenderTemplate reads, renders, and attempts to parse a yaml or
+// RenderTemplateFromFile reads, renders, and attempts to parse a yaml or
 // json file representing one or more k8s api objects
-func RenderTemplate(path string, d *RenderData) ([]*unstructured.Unstructured, error) {
-	tmpl := template.New(path).Option("missingkey=error")
+func RenderTemplateFromFile(path string, d *RenderData) ([]*unstructured.Unstructured, error) {
+	tpl, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to read manifest %s", path)
+	}
+
+	return RenderTemplate(tpl, d)
+}
+
+// RenderTemplateInMemory reads, renders, and attempts to parse a yaml or
+// json bytes representing one or more k8s api objects
+func RenderTemplate(tpl []byte, d *RenderData) ([]*unstructured.Unstructured, error) {
+	tmpl := template.New("render").Option("missingkey=error")
 	if d.Funcs != nil {
 		tmpl.Funcs(d.Funcs)
 	}
@@ -106,18 +117,13 @@ func RenderTemplate(path string, d *RenderData) ([]*unstructured.Unstructured, e
 	tmpl.Funcs(template.FuncMap{"getOr": getOr, "isSet": isSet, "iniEscapeCharacters": iniEscapeCharacters})
 	tmpl.Funcs(sprig.TxtFuncMap())
 
-	source, err := os.ReadFile(path)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to read manifest %s", path)
-	}
-
-	if _, err := tmpl.Parse(string(source)); err != nil {
-		return nil, errors.Wrapf(err, "failed to parse manifest %s as template", path)
+	if _, err := tmpl.Parse(string(tpl)); err != nil {
+		return nil, errors.Wrapf(err, "failed to parse manifest as template")
 	}
 
 	rendered := bytes.Buffer{}
 	if err := tmpl.Execute(&rendered, d.Data); err != nil {
-		return nil, errors.Wrapf(err, "failed to render manifest %s", path)
+		return nil, errors.Wrapf(err, "failed to render manifest")
 	}
 
 	out := []*unstructured.Unstructured{}
@@ -134,7 +140,7 @@ func RenderTemplate(path string, d *RenderData) ([]*unstructured.Unstructured, e
 			if err == io.EOF {
 				break
 			}
-			return nil, errors.Wrapf(err, "failed to unmarshal manifest %s", path)
+			return nil, errors.Wrapf(err, "failed to unmarshal manifest")
 		}
 		out = append(out, &u)
 	}
