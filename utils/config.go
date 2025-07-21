@@ -6,6 +6,7 @@ package utils
 import (
 	"fmt"
 
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
@@ -21,6 +22,27 @@ func GetK8sClient() (client.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("issue with kubeconfig: %s", err)
 	}
+	cl, err := client.New(conf, client.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client: %s", err)
+	}
+	return cl, nil
+}
+
+// GetK8sClientFromFile, provides Kubernetes client handle, for
+// k8s cluster corresponding to the kubeconfig file
+// passed in the function
+func GetK8sClientFromFile(kubeconfig []byte) (client.Client, error) {
+	// Build REST config from raw kubeconfig bytes
+	conf, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kubeconfig: %s", err)
+	}
+
+	if conf.TLSClientConfig.CAFile == "" && len(conf.TLSClientConfig.CAData) == 0 {
+		conf.TLSClientConfig.Insecure = true
+	}
+
 	cl, err := client.New(conf, client.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client: %s", err)
