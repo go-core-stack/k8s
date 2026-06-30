@@ -63,3 +63,47 @@ func ApplyObject(ctx context.Context, client k8sclient.Client, obj *uns.Unstruct
 
 	return nil
 }
+
+// ApplyObjectServerSide applies the desired object using server-side apply
+// (https://kubernetes.io/docs/reference/using-api/server-side-apply/) under the
+// given field manager, instead of the read-modify-write Update that ApplyObject
+// performs. Because SSA does not use a resourceVersion, it never conflicts with
+// another controller writing a different part of the same object (e.g. an
+// operator owning .status while the caller owns .spec). It is idempotent and
+// creates the object if absent.
+//
+// fieldManager must be a stable, caller-unique name; ownership of the fields set
+// here is recorded under it. ForceOwnership is used so the caller takes over any
+// fields previously written by a client-side-apply / Update manager (e.g. when
+// migrating an object from ApplyObject to this function).
+//
+// NOTE: SSA prunes fields this manager previously set but no longer sets, so the
+// caller must render the COMPLETE set of fields it owns on every call.
+func ApplyObjectServerSide(ctx context.Context, client k8sclient.Client, obj *uns.Unstructured, fieldManager string) error {
+	name := obj.GetName()
+	namespace := obj.GetNamespace()
+	if name == "" {
+		return errors.Errorf("Object %s has no name", obj.GroupVersionKind().String())
+	}
+	if fieldManager == "" {
+		return errors.Errorf("Object (%s) %s/%s: fieldManager is required for server-side apply",
+			obj.GroupVersionKind().String(), namespace, name)
+	}
+	objDesc := fmt.Sprintf("(%s) %s/%s", obj.GroupVersionKind().String(), namespace, name)
+	log.Printf("server-side applying %s (fieldManager=%s)", objDesc, fieldManager)
+
+	if err := IsObjectSupported(obj); err != nil {
+		return errors.Wrapf(err, "object %s unsupported", objDesc)
+	}
+
+	// SSA must not carry a resourceVersion (it does not use optimistic
+	// concurrency) nor managedFields (the apiserver maintains those).
+	obj.SetResourceVersion("")
+	obj.SetManagedFields(nil)
+
+	if err := client.Patch(ctx, obj, k8sclient.Apply,
+		k8sclient.FieldOwner(fieldManager), k8sclient.ForceOwnership); err != nil {
+		return errors.Wrapf(err, "could not server-side apply %s", objDesc)
+	}
+	return nil
+}
